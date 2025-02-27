@@ -647,6 +647,7 @@ public class ElevenLabsSDK {
         private var lastSpokeUpdateTimer: Timer?
         private let lastSpokeUpdateInterval: TimeInterval = 0.1 // Update every 100ms
         private let switchToListeningAfterInterval: TimeInterval = 2
+        private let switchToListeningAfterInterval: TimeInterval = 0.1
         private var lastSpokeTimestamp: Date?
 
         private var _mode: Mode = .listening
@@ -709,7 +710,8 @@ public class ElevenLabsSDK {
                         let self,
                         let lastSpokeTimestamp,
                         // Wait until N seconds have elapsed since the last spoken
-                        Date().timeIntervalSince(lastSpokeTimestamp) > self.switchToListeningAfterInterval
+                        Date().timeIntervalSince(lastSpokeTimestamp) > self.switchToListeningAfterInterval,
+                        !output.playerNode.isPlaying
                     else { return }
 
                     // Reset the speech tracking and switch to listening
