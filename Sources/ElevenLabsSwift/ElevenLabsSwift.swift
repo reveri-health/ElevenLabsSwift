@@ -24,11 +24,25 @@ public class ElevenLabsSDK {
         case en, ja, zh, de, hi, fr, ko, pt, it, es, id, nl, tr, pl, sv, bg, ro, ar, cs, el, fi, ms, da, ta, uk, ru, hu, no, vi
     }
 
+    public struct Tool: Codable, Sendable {
+        public let type: String
+        public let name: String
+        public let description: String
+
+        public init(type: String, name: String, description: String) {
+            self.type = type
+            self.name = name
+            self.description = description
+        }
+    }
+
     public struct AgentPrompt: Codable, Sendable {
         public var prompt: String?
+        public var tools: [Tool]?
 
-        public init(prompt: String? = nil) {
+        public init(prompt: String? = nil, tools: [Tool]? = nil) {
             self.prompt = prompt
+            self.tools = tools
         }
     }
 
@@ -239,21 +253,24 @@ public class ElevenLabsSDK {
         public let overrides: ConversationConfigOverride?
         public let customLlmExtraBody: [String: LlmExtraBodyValue]?
         public let dynamicVariables: [String: DynamicVariableValue]?
+        public let isInterruptable: Bool
 
-        public init(signedUrl: String, overrides: ConversationConfigOverride? = nil, customLlmExtraBody: [String: LlmExtraBodyValue]? = nil, clientTools _: ClientTools = ClientTools(), dynamicVariables: [String: DynamicVariableValue]? = nil) {
+        public init(signedUrl: String, overrides: ConversationConfigOverride? = nil, customLlmExtraBody: [String: LlmExtraBodyValue]? = nil, clientTools _: ClientTools = ClientTools(), dynamicVariables: [String: DynamicVariableValue]? = nil, isInterruptable: Bool = true) {
             self.signedUrl = signedUrl
             agentId = nil
             self.overrides = overrides
             self.customLlmExtraBody = customLlmExtraBody
             self.dynamicVariables = dynamicVariables
+            self.isInterruptable = isInterruptable
         }
 
-        public init(agentId: String, overrides: ConversationConfigOverride? = nil, customLlmExtraBody: [String: LlmExtraBodyValue]? = nil, clientTools _: ClientTools = ClientTools(), dynamicVariables: [String: DynamicVariableValue]? = nil) {
+        public init(agentId: String, overrides: ConversationConfigOverride? = nil, customLlmExtraBody: [String: LlmExtraBodyValue]? = nil, clientTools _: ClientTools = ClientTools(), dynamicVariables: [String: DynamicVariableValue]? = nil, isInterruptable: Bool = true) {
             self.agentId = agentId
             signedUrl = nil
             self.overrides = overrides
             self.customLlmExtraBody = customLlmExtraBody
             self.dynamicVariables = dynamicVariables
+            self.isInterruptable = isInterruptable
         }
     }
 
@@ -627,6 +644,10 @@ public class ElevenLabsSDK {
         private var inputVolumeUpdateTimer: Timer?
         private let inputVolumeUpdateInterval: TimeInterval = 0.1 // Update every 100ms
         private var currentInputVolume: Float = 0.0
+        private var lastSpokeUpdateTimer: Timer?
+        private let lastSpokeUpdateInterval: TimeInterval = 0.1 // Update every 100ms
+        private let switchToListeningAfterInterval: TimeInterval = 2
+        private var lastSpokeTimestamp: Date?
 
         private var _mode: Mode = .listening
         private var _status: Status = .connecting
@@ -668,6 +689,8 @@ public class ElevenLabsSDK {
         private let audioConcatProcessor = ElevenLabsSDK.AudioConcatProcessor()
         private var outputBuffers: [[Float]] = [[]]
 
+        public var allowUserToInterrupt: Bool = true
+
         private let logger = Logger(subsystem: "com.elevenlabs.ElevenLabsSDK", category: "Conversation")
 
         private func setupInputVolumeMonitoring() {
@@ -675,6 +698,24 @@ public class ElevenLabsSDK {
                 self.inputVolumeUpdateTimer = Timer.scheduledTimer(withTimeInterval: self.inputVolumeUpdateInterval, repeats: true) { [weak self] _ in
                     guard let self = self else { return }
                     self.callbacks.onVolumeUpdate(self.currentInputVolume)
+                }
+            }
+        }
+
+        private func setupSpeechInterruptMonitoring() {
+            DispatchQueue.main.async {
+                self.lastSpokeUpdateTimer = Timer.scheduledTimer(withTimeInterval: self.lastSpokeUpdateInterval, repeats: true) { [weak self] _ in
+                    guard
+                        let self,
+                        let lastSpokeTimestamp,
+                        // Wait until N seconds have elapsed since the last spoken
+                        Date().timeIntervalSince(lastSpokeTimestamp) > self.switchToListeningAfterInterval
+                    else { return }
+
+                    // Reset the speech tracking and switch to listening
+                    debugPrint("Switching to listening mode")
+                    self.lastSpokeTimestamp = nil
+                    updateMode(.listening)
                 }
             }
         }
@@ -717,6 +758,7 @@ public class ElevenLabsSDK {
             // Set the onProcess callback
             audioConcatProcessor.onProcess = { [weak self] finished in
                 guard let self = self else { return }
+                debugPrint("audioConcatProcessor.onProcess", "finished: \(finished)")
                 if finished {
                     self.updateMode(.listening)
                 }
@@ -725,6 +767,7 @@ public class ElevenLabsSDK {
             setupWebSocket()
             setupAudioProcessing()
             setupInputVolumeMonitoring()
+            setupSpeechInterruptMonitoring()
         }
 
         /// Starts a new conversation session
@@ -756,6 +799,7 @@ public class ElevenLabsSDK {
             output.playerNode.play()
 
             // Step 8: Start recording
+            conversation.allowUserToInterrupt = config.isInterruptable
             conversation.startRecording()
 
             return conversation
@@ -915,6 +959,7 @@ public class ElevenLabsSDK {
                   let eventId = event["event_id"] as? Int,
                   lastInterruptTimestamp <= eventId else { return }
 
+            debugPrint("Enqueuing audio chunk")
             addAudioBase64Chunk(audioBase64)
             updateMode(.speaking)
         }
@@ -945,7 +990,8 @@ public class ElevenLabsSDK {
         private func setupAudioProcessing() {
             // Set the record callback to receive audio buffers
             input.setRecordCallback { [weak self] buffer, rms in
-                guard let self = self, self.isProcessingInput else { return }
+                guard let self else { return }
+                guard self.isProcessingInput else { return }
 
                 // Convert buffer data to base64 string
                 if let int16ChannelData = buffer.int16ChannelData {
@@ -1037,11 +1083,19 @@ public class ElevenLabsSDK {
                     self.audioBuffers.isEmpty ? nil : self.audioBuffers.removeFirst()
                 }
 
-                guard let audioBuffer = buffer else { return }
-
-                self.output.playerNode.scheduleBuffer(audioBuffer) {
-                    self.scheduleNextBuffer()
+                guard let audioBuffer = buffer else {
+                    // There is no more audio to play
+                    lastSpokeTimestamp = Date()
+                    return
                 }
+
+                self.output.playerNode.scheduleBuffer(audioBuffer, completionCallbackType: .dataPlayedBack) { [weak self] callbackType in
+                    guard let self = self else { return }
+                    if callbackType == .dataPlayedBack {
+                        self.scheduleNextBuffer()
+                    }
+                }
+
                 if !self.output.playerNode.isPlaying {
                     self.output.playerNode.play()
                 }
@@ -1067,8 +1121,18 @@ public class ElevenLabsSDK {
 
         private func updateMode(_ newMode: Mode) {
             guard mode != newMode else { return }
+            debugPrint("Mode changed from \(mode) to \(newMode)")
             mode = newMode
             callbacks.onModeChange(newMode)
+
+            // If users cannot interrupt during playback, stop recording and restart on listen
+            guard !allowUserToInterrupt else { return }
+            switch newMode {
+            case .speaking:
+                stopRecording()
+            case .listening:
+                startRecording()
+            }
         }
 
         private func updateStatus(_ newStatus: Status) {
@@ -1188,9 +1252,9 @@ public class ElevenLabsSDK {
             try audioSession.setPreferredSampleRate(16000)
 
             // Request input gain control if available
-            if audioSession.isInputGainSettable {
-                try audioSession.setInputGain(1.0)
-            }
+//            if audioSession.isInputGainSettable {
+//                try audioSession.setInputGain(1.0)
+//            }
 
             // Activate the session
             try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
